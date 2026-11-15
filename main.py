@@ -5,15 +5,16 @@ import logging
 from typing import Optional
 from cachetools import TTLCache
 from curl_cffi.requests import AsyncSession
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, FeatureNotFound
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 try:
     from trivia import TRIVIA_LIST
-except ImportError:
+except ModuleNotFoundError as error:
+    if error.name != "trivia":
+        raise
     TRIVIA_LIST = ["Letterboxd verileri taranıyor..."]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -21,16 +22,10 @@ logger = logging.getLogger("kadrajdas")
 
 app = FastAPI(title="Kadrajdaş | Kült Sinema Kulübü")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # Bellek şişmesini önleyen bounded TTL Cache (Max 500 kullanıcı, 600 saniye TTL)
 USER_CACHE: TTLCache = TTLCache(maxsize=500, ttl=600)
+USERNAME_PATTERN = re.compile(r"[a-z0-9_][a-z0-9_-]{0,63}", re.ASCII)
 
 HTML_CONTENT = """<!DOCTYPE html>
 <html lang="tr">
@@ -147,7 +142,7 @@ HTML_CONTENT = """<!DOCTYPE html>
             nextIndex = Math.floor(Math.random() * TRIVIA_LIST.length);
           } while (nextIndex === lastIndex && TRIVIA_LIST.length > 1);
           lastIndex = nextIndex;
-          
+
           elem.innerText = TRIVIA_LIST[nextIndex];
           elem.style.opacity = "1";
         }, 300);
@@ -160,7 +155,7 @@ HTML_CONTENT = """<!DOCTYPE html>
         triviaInterval = null;
       }
     }
-  
+
     async function compareProfiles() {
       const u1 = document.getElementById("user1").value.trim();
       const u2 = document.getElementById("user2").value.trim();
@@ -253,13 +248,15 @@ def extract_rating(element) -> Optional[float]:
                 return float(stars)
     return None
 
-def parse_films_from_html(html_text: str) -> dict[str, Optional[float]]:
-    # 'lxml' ayrıştırma performansı html.parser'a göre daha yüksektir.
-    parser_type = "lxml"
+def parse_html(html_text: str) -> BeautifulSoup:
     try:
-        soup = BeautifulSoup(html_text, parser_type)
-    except Exception:
-        soup = BeautifulSoup(html_text, "html.parser")
+        return BeautifulSoup(html_text, "lxml")
+    except FeatureNotFound:
+        return BeautifulSoup(html_text, "html.parser")
+
+
+def parse_films_from_html(html_text: str) -> dict[str, Optional[float]]:
+    soup = parse_html(html_text)
 
     items = soup.select("ul.poster-list li, grid-item, li.poster-container")
     if not items:
@@ -297,11 +294,7 @@ def parse_films_from_html(html_text: str) -> dict[str, Optional[float]]:
     return page_films
 
 def extract_total_pages(html_text: str) -> int:
-    parser_type = "lxml"
-    try:
-        soup = BeautifulSoup(html_text, parser_type)
-    except Exception:
-        soup = BeautifulSoup(html_text, "html.parser")
+    soup = parse_html(html_text)
 
     paginate_links = soup.select("div.paginate-pages ul li a")
     max_p = 1
@@ -355,12 +348,13 @@ async def fetch_user_films_fast(username: str) -> Optional[dict[str, Optional[fl
                 for p in range(2, total_pages + 1)
             ]
             results = await asyncio.gather(*tasks)
-            
+
             for page_num, page_dict in results:
                 if page_dict is not None:
                     all_films.update(page_dict)
                 else:
-                    logger.warning(f"[{username}] Sayfa {page_num} eksik çekildi.")
+                    logger.warning("[%s] Sayfa %s eksik çekildi.", username, page_num)
+                    return None
 
     logger.info(f"[{username}] Çekim tamamlandı: {len(all_films)} film.")
     USER_CACHE[username] = all_films
@@ -384,8 +378,8 @@ async def api_match(payload: MatchRequest):
         u1 = payload.user1.strip().lower()
         u2 = payload.user2.strip().lower()
 
-        if not u1 or not u2:
-            return JSONResponse({"success": False, "message": "Kullanıcı adları boş bırakılamaz."})
+        if not USERNAME_PATTERN.fullmatch(u1) or not USERNAME_PATTERN.fullmatch(u2):
+            return JSONResponse({"success": False, "message": "Geçerli iki Letterboxd kullanıcı adı girin."})
 
         data1, data2 = await asyncio.gather(
             fetch_user_films_fast(u1),
@@ -394,31 +388,31 @@ async def api_match(payload: MatchRequest):
 
         if data1 is None or data2 is None:
             return JSONResponse({
-                "success": False, 
+                "success": False,
                 "message": "Kullanıcı verilerine erişilemedi. Profil gizlilik ayarlarını veya kullanıcı adlarını kontrol edin."
             })
 
         set1, set2 = set(data1.keys()), set(data2.keys())
         if not set1 or not set2:
             return JSONResponse({
-                "success": False, 
+                "success": False,
                 "message": f"Katalog boş veya taranamadı. ({u1}: {len(set1)}, {u2}: {len(set2)})"
             })
 
         common = set1.intersection(set2)
         union = set1.union(set2)
-        
+
         # Jaccard Benzerliği: |A ∩ B| / |A ∪ B|
         jaccard_overlap = len(common) / len(union) if union else 0.0
 
         rated_common = [f for f in common if data1.get(f) is not None and data2.get(f) is not None]
-        
+
         if rated_common:
             # Puan farkı normalize hesabı: Ortalamada farkın 4.5 puandan uzaklığı
             diffs = [abs(data1[f] - data2[f]) for f in rated_common]
             mean_diff = sum(diffs) / len(rated_common)
             raw_rating_score = 1.0 - (mean_diff / 4.5)
-            
+
             # Bayes/Laplace yumuşatması: Az sayıda ortak filmde puanın aşırı sapmasını regüle eder
             weight = min(len(rated_common) / 10.0, 1.0)
             rating_score = (raw_rating_score * weight) + (0.5 * (1.0 - weight))
@@ -437,12 +431,12 @@ async def api_match(payload: MatchRequest):
             "user1_total": len(set1),
             "user2_total": len(set2),
             "rated_count": len(rated_common),
-            "sample_films": [f.replace("-", " ").title() for f in list(common)[:15]]
+            "sample_films": [f.replace("-", " ").title() for f in sorted(common)[:15]]
         })
 
-    except Exception as e:
-        logger.exception("Eşleştirme sürecinde beklenmeyen sunucu hatası:")
-        return JSONResponse({"success": False, "message": f"Sunucu hatası: {str(e)}"})
+    except Exception:
+        logger.exception("Eşleştirme sürecinde beklenmeyen sunucu hatası.")
+        return JSONResponse({"success": False, "message": "Eşleştirme sırasında beklenmeyen bir hata oluştu."}, status_code=500)
 
 if __name__ == "__main__":
     import uvicorn
